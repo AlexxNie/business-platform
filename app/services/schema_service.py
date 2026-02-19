@@ -19,14 +19,17 @@ from app.core.dynamic_tables import (
     create_bo_table, get_table_name, add_column, drop_column,
     drop_bo_table, table_exists, get_table_columns,
 )
+from app.core.errors import ConflictError, NotFoundError, ErrorDetail
 from app.database import sync_engine
 
 logger = logging.getLogger(__name__)
 
 
 async def create_bo_definition(session: AsyncSession, data: dict) -> BODefinition:
-    """Create a new BO definition and its database table."""
+    """Create a new BO definition and its database table.
 
+    Raises ConflictError if BO already exists (mit Hint auf PUT).
+    """
     code = data["code"]
     table_name = get_table_name(code)
 
@@ -35,7 +38,15 @@ async def create_bo_definition(session: AsyncSession, data: dict) -> BODefinitio
         select(BODefinition).where(BODefinition.code == code)
     )
     if existing.scalar_one_or_none():
-        raise ValueError(f"BO definition '{code}' already exists")
+        raise ConflictError(
+            f"BO definition '{code}' already exists.",
+            details=[ErrorDetail(
+                code="DUPLICATE_BO_DEFINITION",
+                message=f"A BO definition with code '{code}' already exists.",
+                field="code",
+                hint=f"Use PUT /api/v1/schema/definitions/{code} to update the existing definition.",
+            )],
+        )
 
     # Resolve module
     module_id = None
@@ -44,8 +55,17 @@ async def create_bo_definition(session: AsyncSession, data: dict) -> BODefinitio
             select(Module).where(Module.code == data["module_code"])
         )
         mod = module.scalar_one_or_none()
-        if mod:
-            module_id = mod.id
+        if not mod:
+            raise NotFoundError(
+                f"Module '{data['module_code']}' not found.",
+                details=[ErrorDetail(
+                    code="MODULE_NOT_FOUND",
+                    message=f"Module '{data['module_code']}' does not exist.",
+                    field="module_code",
+                    hint="Create the module first with PUT /api/v1/schema/modules/{code}",
+                )],
+            )
+        module_id = mod.id
 
     # Resolve parent BO
     parent_bo_id = None
@@ -143,6 +163,109 @@ async def create_bo_definition(session: AsyncSession, data: dict) -> BODefinitio
     return result.scalar_one()
 
 
+async def upsert_bo_definition(session: AsyncSession, code: str, data: dict) -> tuple[BODefinition, bool]:
+    """Create or update a BO definition. Returns (bo_def, created).
+
+    Idempotent: If BO exists, updates name/description/icon/module.
+    Does NOT recreate the table or re-add existing fields.
+    """
+    existing = await get_bo_definition(session, code)
+
+    if existing:
+        # Update existing BO
+        if data.get("name"):
+            existing.name = data["name"]
+        if "description" in data:
+            existing.description = data.get("description")
+        if "icon" in data:
+            existing.icon = data.get("icon")
+        if "display_field" in data:
+            existing.display_field = data.get("display_field")
+
+        # Update module assignment
+        if data.get("module_code"):
+            module = await session.execute(
+                select(Module).where(Module.code == data["module_code"])
+            )
+            mod = module.scalar_one_or_none()
+            if mod:
+                existing.module_id = mod.id
+
+        # Add new fields that don't exist yet
+        existing_field_codes = {f.code for f in existing.fields}
+        for i, field_data in enumerate(data.get("fields", [])):
+            if field_data["code"] not in existing_field_codes:
+                field = FieldDefinition(
+                    bo_definition_id=existing.id,
+                    code=field_data["code"],
+                    name=field_data["name"],
+                    field_type=field_data["field_type"],
+                    description=field_data.get("description"),
+                    required=field_data.get("required", False),
+                    unique=field_data.get("unique", False),
+                    indexed=field_data.get("indexed", False),
+                    max_length=field_data.get("max_length"),
+                    default_value=field_data.get("default_value"),
+                    enum_values=field_data.get("enum_values"),
+                    reference_bo_code=field_data.get("reference_bo_code"),
+                    is_searchable=field_data.get("is_searchable", False),
+                    sort_order=field_data.get("sort_order", len(existing_field_codes) + i),
+                )
+                session.add(field)
+                await session.flush()
+                # ALTER TABLE ADD COLUMN
+                if existing.table_created:
+                    add_column(sync_engine, existing.table_name, field)
+
+        # Add/update workflow if provided and not existing
+        if data.get("workflow") and not existing.workflow:
+            wf_data = data["workflow"]
+            workflow = WorkflowDefinition(
+                bo_definition_id=existing.id,
+                initial_state=wf_data["initial_state"],
+            )
+            session.add(workflow)
+            await session.flush()
+
+            for s in wf_data.get("states", []):
+                state = WorkflowState(
+                    workflow_id=workflow.id,
+                    code=s["code"],
+                    name=s["name"],
+                    color=s.get("color"),
+                    is_final=s.get("is_final", False),
+                    sort_order=s.get("sort_order", 0),
+                )
+                session.add(state)
+
+            for t in wf_data.get("transitions", []):
+                trans = WorkflowTransition(
+                    workflow_id=workflow.id,
+                    code=t["code"],
+                    name=t["name"],
+                    from_state=t["from_state"],
+                    to_state=t["to_state"],
+                    conditions=t.get("conditions"),
+                    webhook_url=t.get("webhook_url"),
+                )
+                session.add(trans)
+
+        await session.commit()
+
+        # Reload with relations
+        result = await session.execute(
+            select(BODefinition)
+            .options(selectinload(BODefinition.fields))
+            .where(BODefinition.id == existing.id)
+        )
+        return result.scalar_one(), False
+
+    # Create new — delegate to create_bo_definition
+    data["code"] = code
+    bo_def = await create_bo_definition(session, data)
+    return bo_def, True
+
+
 async def get_bo_definition(session: AsyncSession, code: str) -> BODefinition | None:
     """Get a BO definition by code with all fields and workflow."""
     result = await session.execute(
@@ -170,16 +293,39 @@ async def list_bo_definitions(session: AsyncSession, module_code: str | None = N
     return result.scalars().all()
 
 
-async def add_field_to_bo(session: AsyncSession, bo_code: str, field_data: dict) -> FieldDefinition:
-    """Add a new field to an existing BO definition."""
+async def add_field_to_bo(session: AsyncSession, bo_code: str, field_data: dict) -> tuple[FieldDefinition, bool]:
+    """Add a new field to an existing BO definition.
+
+    Idempotent: If field with same code and type exists, returns it.
+    Returns (field, created).
+    """
     bo_def = await get_bo_definition(session, bo_code)
     if not bo_def:
-        raise ValueError(f"BO definition '{bo_code}' not found")
+        raise NotFoundError(
+            f"BO definition '{bo_code}' not found.",
+            details=[ErrorDetail(
+                code="BO_NOT_FOUND",
+                message=f"BO definition '{bo_code}' does not exist.",
+                hint="Create it first with POST/PUT /api/v1/schema/definitions",
+            )],
+        )
 
-    # Check field doesn't exist
+    # Check field exists — idempotent
     for f in bo_def.fields:
         if f.code == field_data["code"]:
-            raise ValueError(f"Field '{field_data['code']}' already exists on {bo_code}")
+            if f.field_type == field_data["field_type"]:
+                # Same field, same type → idempotent return
+                return f, False
+            raise ConflictError(
+                f"Field '{field_data['code']}' already exists on '{bo_code}' with type '{f.field_type}'.",
+                details=[ErrorDetail(
+                    code="DUPLICATE_FIELD",
+                    message=f"Field '{field_data['code']}' exists with type '{f.field_type}', "
+                            f"but you requested type '{field_data['field_type']}'.",
+                    field="code",
+                    hint="Remove the existing field first or use the same field_type.",
+                )],
+            )
 
     field = FieldDefinition(
         bo_definition_id=bo_def.id,
@@ -204,14 +350,20 @@ async def add_field_to_bo(session: AsyncSession, bo_code: str, field_data: dict)
     add_column(sync_engine, bo_def.table_name, field)
 
     await session.commit()
-    return field
+    return field, True
 
 
 async def remove_field_from_bo(session: AsyncSession, bo_code: str, field_code: str) -> bool:
     """Remove a field from a BO definition."""
     bo_def = await get_bo_definition(session, bo_code)
     if not bo_def:
-        raise ValueError(f"BO definition '{bo_code}' not found")
+        raise NotFoundError(
+            f"BO definition '{bo_code}' not found.",
+            details=[ErrorDetail(
+                code="BO_NOT_FOUND",
+                message=f"BO definition '{bo_code}' does not exist.",
+            )],
+        )
 
     field = None
     for f in bo_def.fields:
@@ -220,7 +372,14 @@ async def remove_field_from_bo(session: AsyncSession, bo_code: str, field_code: 
             break
 
     if not field:
-        raise ValueError(f"Field '{field_code}' not found on {bo_code}")
+        raise NotFoundError(
+            f"Field '{field_code}' not found on '{bo_code}'.",
+            details=[ErrorDetail(
+                code="FIELD_NOT_FOUND",
+                message=f"Field '{field_code}' does not exist on BO '{bo_code}'.",
+                field="field_code",
+            )],
+        )
 
     # DROP COLUMN
     drop_column(sync_engine, bo_def.table_name, field_code)
@@ -234,7 +393,13 @@ async def delete_bo_definition(session: AsyncSession, code: str) -> bool:
     """Delete a BO definition and its database table."""
     bo_def = await get_bo_definition(session, code)
     if not bo_def:
-        raise ValueError(f"BO definition '{code}' not found")
+        raise NotFoundError(
+            f"BO definition '{code}' not found.",
+            details=[ErrorDetail(
+                code="BO_NOT_FOUND",
+                message=f"BO definition '{code}' does not exist.",
+            )],
+        )
 
     # Drop the dynamic table
     if bo_def.table_created:
@@ -249,7 +414,13 @@ async def get_table_info(session: AsyncSession, bo_code: str) -> dict:
     """Get actual database table info for a BO (for TSI-like view)."""
     bo_def = await get_bo_definition(session, bo_code)
     if not bo_def:
-        raise ValueError(f"BO definition '{bo_code}' not found")
+        raise NotFoundError(
+            f"BO definition '{bo_code}' not found.",
+            details=[ErrorDetail(
+                code="BO_NOT_FOUND",
+                message=f"BO definition '{bo_code}' does not exist.",
+            )],
+        )
 
     columns = get_table_columns(sync_engine, bo_def.table_name)
     exists = table_exists(sync_engine, bo_def.table_name)

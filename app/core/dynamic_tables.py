@@ -11,6 +11,7 @@ Bei Schema-Aenderungen (Feld hinzufuegen/entfernen):
 """
 
 import logging
+import re
 from sqlalchemy import (
     MetaData, Table, Column, BigInteger, String, DateTime, Text,
     Index, ForeignKey, UniqueConstraint, inspect, text,
@@ -24,16 +25,34 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Regex fuer sichere SQL-Identifier (Tabellen-/Spaltennamen)
+_SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,126}$")
+
+
+def _assert_safe_identifier(name: str, context: str = "identifier") -> None:
+    """Stellt sicher, dass ein Name als SQL-Identifier sicher ist.
+
+    Verhindert SQL-Injection ueber Tabellen-/Spaltennamen.
+    """
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(
+            f"Unsafe {context}: '{name}'. "
+            f"Must match ^[a-zA-Z_][a-zA-Z0-9_]{{0,126}}$ (letters, digits, underscore)."
+        )
+
 
 def get_table_name(bo_code: str) -> str:
     """Generate table name from BO code."""
-    return f"{settings.bo_table_prefix}{bo_code.lower()}"
+    table_name = f"{settings.bo_table_prefix}{bo_code.lower()}"
+    _assert_safe_identifier(table_name, "table name")
+    return table_name
 
 
 def build_columns(fields) -> list[Column]:
     """Build SQLAlchemy columns from FieldDefinitions."""
     columns = []
     for field in fields:
+        _assert_safe_identifier(field.code, "column name")
         col_type = get_column_type(field)
         col_kwargs = {
             "nullable": not field.required,
@@ -60,7 +79,18 @@ def create_bo_table(engine: Engine, bo_definition, fields) -> str:
     Returns the table name.
     """
     table_name = bo_definition.table_name
+    _assert_safe_identifier(table_name, "table name")
     metadata = MetaData()
+
+    # Reflect referenced tables so ForeignKey resolution works
+    ref_tables = set()
+    for field in fields:
+        if field.field_type == "reference" and field.reference_bo_code:
+            ref_table = get_table_name(field.reference_bo_code)
+            ref_tables.add(ref_table)
+    for ref_table in ref_tables:
+        if table_exists(engine, ref_table):
+            Table(ref_table, metadata, autoload_with=engine)
 
     # System columns (always present)
     system_columns = [
@@ -108,22 +138,34 @@ def create_bo_table(engine: Engine, bo_definition, fields) -> str:
 
 def add_column(engine: Engine, table_name: str, field) -> None:
     """Add a column to an existing BO table."""
+    _assert_safe_identifier(table_name, "table name")
+    _assert_safe_identifier(field.code, "column name")
+
     col_type = get_column_type(field)
     type_str = col_type.compile(dialect=engine.dialect)
     nullable = "NULL" if not field.required else "NOT NULL"
 
+    # Parametrisierter Default-Wert (kein f-String!)
     sql = f'ALTER TABLE "{table_name}" ADD COLUMN "{field.code}" {type_str} {nullable}'
 
-    if field.default_value is not None:
-        sql += f" DEFAULT '{field.default_value}'"
-
     with engine.begin() as conn:
-        conn.execute(text(sql))
+        if field.default_value is not None:
+            # Sicherer parametrisierter Default via SET DEFAULT
+            conn.execute(text(sql))
+            conn.execute(text(
+                f'ALTER TABLE "{table_name}" ALTER COLUMN "{field.code}" SET DEFAULT :default_val'
+            ), {"default_val": field.default_value})
+        else:
+            conn.execute(text(sql))
+
     logger.info(f"Added column {field.code} to {table_name}")
 
 
 def drop_column(engine: Engine, table_name: str, column_code: str) -> None:
     """Remove a column from a BO table."""
+    _assert_safe_identifier(table_name, "table name")
+    _assert_safe_identifier(column_code, "column name")
+
     with engine.begin() as conn:
         conn.execute(text(f'ALTER TABLE "{table_name}" DROP COLUMN IF EXISTS "{column_code}"'))
     logger.info(f"Dropped column {column_code} from {table_name}")
@@ -131,6 +173,8 @@ def drop_column(engine: Engine, table_name: str, column_code: str) -> None:
 
 def drop_bo_table(engine: Engine, table_name: str) -> None:
     """Drop a BO table entirely."""
+    _assert_safe_identifier(table_name, "table name")
+
     with engine.begin() as conn:
         conn.execute(text(f'DROP TABLE IF EXISTS "{table_name}" CASCADE'))
     logger.info(f"Dropped table: {table_name}")

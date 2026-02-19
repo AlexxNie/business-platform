@@ -14,14 +14,110 @@ from app.models.module import Module
 from app.models.bo_definition import BODefinition
 from app.models.field_definition import FieldDefinition
 from app.models.workflow import WorkflowDefinition, WorkflowState, WorkflowTransition
+from app.core.errors import NotFoundError, ErrorDetail
 
 router = APIRouter(prefix="/introspect", tags=["Introspection (TSI View)"])
 
 
-@router.get("/overview")
-async def platform_overview(db: AsyncSession = Depends(get_db)):
-    """Complete platform overview - shows everything an AI needs to understand the system."""
+FILTER_OPERATORS = {
+    "eq": "Exact match (default)",
+    "ne": "Not equal",
+    "gt": "Greater than",
+    "gte": "Greater than or equal",
+    "lt": "Less than",
+    "lte": "Less than or equal",
+    "contains": "ILIKE %value%",
+    "startswith": "ILIKE value%",
+    "endswith": "ILIKE %value",
+    "in": "IN (comma-separated values)",
+    "isnull": "IS NULL (true) / IS NOT NULL (false)",
+}
 
+
+def _build_field_info(f, include_details: bool = False) -> dict:
+    """Build field info dict."""
+    info = {
+        "code": f.code,
+        "name": f.name,
+        "type": f.field_type,
+        "required": f.required,
+        "unique": f.unique,
+    }
+    if include_details:
+        info.update({
+            "description": f.description,
+            "indexed": f.indexed,
+            "max_length": f.max_length,
+            "default_value": f.default_value,
+            "is_searchable": f.is_searchable,
+            "sort_order": f.sort_order,
+        })
+    if f.enum_values:
+        info["enum_values"] = f.enum_values
+    if f.reference_bo_code:
+        info["reference"] = f.reference_bo_code
+    return info
+
+
+def _build_workflow_info(workflow) -> dict | None:
+    """Build workflow info dict."""
+    if not workflow:
+        return None
+    return {
+        "initial_state": workflow.initial_state,
+        "states": [
+            {"code": s.code, "name": s.name, "color": s.color, "is_final": s.is_final}
+            for s in workflow.states
+        ],
+        "transitions": [
+            {
+                "code": t.code, "name": t.name,
+                "from": t.from_state, "to": t.to_state,
+            }
+            for t in workflow.transitions
+        ],
+    }
+
+
+def _build_example_payload(fields, workflow=None) -> dict:
+    """Generate an example POST payload for a BO."""
+    example = {}
+    for f in fields:
+        if f.field_type == "text":
+            example[f.code] = f"Example {f.name}"
+        elif f.field_type == "integer":
+            example[f.code] = 1
+        elif f.field_type == "float":
+            example[f.code] = 1.0
+        elif f.field_type == "boolean":
+            example[f.code] = True
+        elif f.field_type == "date":
+            example[f.code] = "2026-01-15"
+        elif f.field_type == "datetime":
+            example[f.code] = "2026-01-15T10:30:00Z"
+        elif f.field_type == "email":
+            example[f.code] = "user@example.com"
+        elif f.field_type == "url":
+            example[f.code] = "https://example.com"
+        elif f.field_type == "enum" and f.enum_values:
+            vals = f.enum_values if isinstance(f.enum_values, list) else list(f.enum_values)
+            example[f.code] = vals[0] if vals else "value"
+        elif f.field_type == "json":
+            example[f.code] = {}
+        elif f.field_type == "reference":
+            example[f.code] = 1
+    return example
+
+
+@router.get(
+    "/overview",
+    summary="Plattform-Uebersicht",
+    description=(
+        "Komplette Plattform-Uebersicht fuer AI-Agents und Frontends.\n\n"
+        "Zeigt alle Module, BO-Definitionen, Felder und Workflows."
+    ),
+)
+async def platform_overview(db: AsyncSession = Depends(get_db)):
     # Modules
     modules_result = await db.execute(select(Module).order_by(Module.code))
     modules = modules_result.scalars().all()
@@ -58,36 +154,9 @@ async def platform_overview(db: AsyncSession = Depends(get_db)):
             "table_name": bo.table_name,
             "table_created": bo.table_created,
             "display_field": bo.display_field,
-            "fields": [
-                {
-                    "code": f.code,
-                    "name": f.name,
-                    "type": f.field_type,
-                    "required": f.required,
-                    "unique": f.unique,
-                    "enum_values": f.enum_values,
-                    "reference": f.reference_bo_code,
-                }
-                for f in bo.fields
-            ],
-            "workflow": None,
+            "fields": [_build_field_info(f, include_details=True) for f in bo.fields],
+            "workflow": _build_workflow_info(bo.workflow),
         }
-
-        if bo.workflow:
-            bo_info["workflow"] = {
-                "initial_state": bo.workflow.initial_state,
-                "states": [
-                    {"code": s.code, "name": s.name, "color": s.color, "is_final": s.is_final}
-                    for s in bo.workflow.states
-                ],
-                "transitions": [
-                    {
-                        "code": t.code, "name": t.name,
-                        "from": t.from_state, "to": t.to_state,
-                    }
-                    for t in bo.workflow.transitions
-                ],
-            }
 
         if bo.module_id and bo.module_id in module_map:
             module_map[bo.module_id]["bo_definitions"].append(bo_info)
@@ -104,19 +173,120 @@ async def platform_overview(db: AsyncSession = Depends(get_db)):
             "bo_definitions": len(bo_defs),
             "total_fields": sum(len(bo.fields) for bo in bo_defs),
         },
+        "hints": {
+            "create_module": "PUT /api/v1/schema/modules/{code}",
+            "create_bo": "PUT /api/v1/schema/definitions/{code}",
+            "bo_details": "GET /api/v1/introspect/bo/{bo_code}",
+            "create_record": "POST /api/v1/data/{bo_code}",
+            "filter_syntax": "GET /api/v1/data/{bo_code}?field__operator=value",
+            "available_operators": list(FILTER_OPERATORS.keys()),
+        },
     }
 
 
-@router.get("/suggest")
-async def suggest_extensions(db: AsyncSession = Depends(get_db)):
-    """AI-friendly endpoint: Analyze current schema and suggest improvements.
+@router.get(
+    "/bo/{bo_code}",
+    summary="BO-Detail-Introspection",
+    description=(
+        "Alles was ein LLM-Agent braucht um mit einem BO zu arbeiten:\n\n"
+        "- Alle Felder mit Typ, Constraints, Enum-Werte, Referenz-Ziel\n"
+        "- Beispiel-Payload fuer POST\n"
+        "- Verfuegbare Filter-Operatoren\n"
+        "- Workflow-States und Transitions\n"
+        "- Endpoint-URLs"
+    ),
+    responses={404: {"description": "BO nicht gefunden"}},
+)
+async def bo_introspection(bo_code: str, db: AsyncSession = Depends(get_db)):
+    """Detaillierte BO-Informationen fuer LLM-Agents."""
+    # Load BO with all relations
+    result = await db.execute(
+        select(BODefinition)
+        .options(
+            selectinload(BODefinition.fields),
+            selectinload(BODefinition.workflow).selectinload(WorkflowDefinition.states),
+            selectinload(BODefinition.workflow).selectinload(WorkflowDefinition.transitions),
+        )
+        .where(BODefinition.code == bo_code)
+    )
+    bo = result.scalar_one_or_none()
 
-    Returns suggestions like:
-    - Missing indexes on frequently queried fields
-    - BOs without workflows
-    - Fields that could benefit from validation
-    - Missing references between related BOs
-    """
+    if not bo or not bo.table_created:
+        raise NotFoundError(
+            f"Business Object '{bo_code}' not found.",
+            details=[ErrorDetail(
+                code="BO_NOT_FOUND",
+                message=f"BO '{bo_code}' does not exist or its table has not been created.",
+                hint="Use GET /api/v1/introspect/overview to see all available BOs.",
+            )],
+        )
+
+    # Build field details
+    fields_detail = []
+    required_fields = []
+    for f in bo.fields:
+        fd = {
+            "code": f.code,
+            "name": f.name,
+            "type": f.field_type,
+            "required": f.required,
+            "unique": f.unique,
+            "indexed": f.indexed,
+            "max_length": f.max_length,
+            "default_value": f.default_value,
+            "description": f.description,
+            "is_searchable": f.is_searchable,
+        }
+        if f.enum_values:
+            fd["enum_values"] = f.enum_values
+        if f.reference_bo_code:
+            fd["reference_bo_code"] = f.reference_bo_code
+        fields_detail.append(fd)
+        if f.required:
+            required_fields.append(f.code)
+
+    # Example payload
+    example_payload = _build_example_payload(bo.fields, bo.workflow)
+
+    # Endpoints
+    base = f"/api/v1/data/{bo_code}"
+    endpoints = {
+        "list": f"GET {base}",
+        "create": f"POST {base}",
+        "get": f"GET {base}/{{id}}",
+        "update": f"PUT {base}/{{id}}",
+        "delete": f"DELETE {base}/{{id}}",
+    }
+    if bo.workflow:
+        endpoints["transitions"] = f"GET {base}/{{id}}/transitions"
+        endpoints["execute_transition"] = f"POST {base}/{{id}}/transitions/{{code}}"
+
+    response = {
+        "bo_code": bo.code,
+        "name": bo.name,
+        "description": bo.description,
+        "table_name": bo.table_name,
+        "display_field": bo.display_field,
+        "fields": fields_detail,
+        "required_fields": required_fields,
+        "example_payload": example_payload,
+        "endpoints": endpoints,
+        "filter_operators": FILTER_OPERATORS,
+        "workflow": _build_workflow_info(bo.workflow),
+    }
+
+    return response
+
+
+@router.get(
+    "/suggest",
+    summary="Schema-Verbesserungsvorschlaege",
+    description=(
+        "Analysiert das aktuelle Schema und gibt Verbesserungsvorschlaege.\n\n"
+        "Nuetzlich fuer AI-Agents die das System optimieren wollen."
+    ),
+)
+async def suggest_extensions(db: AsyncSession = Depends(get_db)):
     bo_result = await db.execute(
         select(BODefinition)
         .options(
@@ -135,6 +305,7 @@ async def suggest_extensions(db: AsyncSession = Depends(get_db)):
                 "type": "add_workflow",
                 "bo_code": bo.code,
                 "message": f"BO '{bo.name}' has no workflow. Consider adding states for lifecycle management.",
+                "hint": f"Use PUT /api/v1/schema/definitions/{bo.code} with a 'workflow' property.",
             })
 
         # No display field?
