@@ -55,6 +55,17 @@ FastAPI App (async)
 - DB-Zugangsdaten: bizplatform/bizplatform/bizplatform
 - Container sind aktuell NICHT gestartet
 
+## Versionierung
+
+- Aktuelle Version: `1.0.0` (in `app/config.py` → `app_version`)
+- Schema: Semantic Versioning — `MAJOR.MINOR.PATCH`
+- Bei jeder aenderung die committed und gepusht wird: Minor-Version erhoehen (1.0 → 1.1 → 1.2 ...)
+- Workflow bei jedem Push:
+  1. `app_version` in `app/config.py` erhoehen
+  2. Committen und pushen
+  3. GitHub Release erstellen: `gh release create vX.Y.0 --generate-notes`
+- GitHub Repo: https://github.com/AlexxNie/business-platform
+
 ## Status / Offene Punkte
 
 - Kern-Engine funktionsfaehig (dynamische Tabellen, CRUD, Workflows)
