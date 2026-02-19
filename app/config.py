@@ -4,7 +4,7 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     app_name: str = "Business Platform"
-    app_version: str = "0.1.0"
+    app_version: str = "1.0.0"
     debug: bool = False
 
     database_url: str = "postgresql+asyncpg://bizplatform:bizplatform@localhost:5432/bizplatform"
